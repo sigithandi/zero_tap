@@ -13,7 +13,7 @@ import java.util.function.BiConsumer
 import java.util.function.Consumer
 import java.util.regex.Pattern
 
-
+//komentar
 class SmsBroadcastReceiver() : BroadcastReceiver() {
     private lateinit var onOtpReceived: (String) -> Unit
 
