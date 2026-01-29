@@ -1,0 +1,86 @@
+FAZPASS OTP INTEGRATION GUIDE
+
+1. HOW TO CREATE 11-CHARACTER APP HASH
+---------------------------------------------------------
+The App Hash is a unique 11-character string verifying your app's identity. It relies on your keystore signing certificate (Debug or Release).
+
+Method A: Using Logcat (Easiest for Debugging)
+   1. Run the app on your device or emulator.
+   2. Open the "Logcat" tab in Android Studio.
+   3. Type "AppSignatureHelper" in the search bar.
+   4. You will see a log entry like: "Hash identifying this app: xxxxxxxxxxx"
+   5. Copy that 11-character string.
+   
+   *IMPORTANT*: This hash is generated from your keystore. If you move to a new computer or build a Release APK (signed with a release key), this hash WILL CHANGE. You must assume the hash you get in Debug mode is different from your Production mode.
+
+Method B: Using Keytool (For Production/Release)
+   To generate the hash without running the app, use this command structure (requires Linux/Mac terminal or Git Bash):
+   keytool -exportcert -alias <your-key-alias> -keystore <path-to-keystore> | xxd -p | tr -d "[:space:]" | echo -n com.example.fazpassotp `cat` | sha256sum | tr -d "[:space:]-" | xxd -r -p | base64 | cut -c1-11
+
+2. HOW TO USE AppSignatureHelper IN CODE
+---------------------------------------------------------
+The `AppSignatureHelper` is a utility class that programmatically calculates the App Hash similar to how the Keytool command does.
+
+Where is it used?
+   - It is typically instantiated in `MainActivity.kt` during `onCreate`.
+
+How to use it:
+   val appSignatureHelper = AppSignatureHelper(this)
+   for (signature in appSignatureHelper.appSignatures) {
+       Log.e("AppSignatureHelper", "Hash: $signature")
+   }
+
+Purpose:
+   - Its ONLY purpose is to log the hash so you (the developer) can see it and configure your SMS templates.
+   - It is NOT required for the actual OTP auto-fill to work. You can remove this code in production if you wish, once you have your hash.
+
+3. WHAT IS SmsBroadcastReceiver?
+---------------------------------------------------------
+`SmsBroadcastReceiver` is a class that extends `BroadcastReceiver`. It listens for a specific system event: `SmsRetriever.SMS_RETRIEVED_ACTION`.
+
+How it works:
+   1. Google Play Services detects an incoming SMS starting with `<#>`.
+   2. It verifies the hash at the end of the message matches your app.
+   3. If it matches, it broadcasts an Intent containing the message text.
+   4. `SmsBroadcastReceiver` intercepts this intent.
+   5. Inside `onReceive`, it parses the message (using Regex) to find the 4-digit code.
+   6. It invokes a callback function (lambda) to pass this code back to `MainActivity`.
+
+How to use it (in MainActivity):
+
+   // 1. Define the callback action (what to do with the OTP)
+   val smsBroadcastReceiver = SmsBroadcastReceiver { otp ->
+       // Example: Update ViewModel
+       viewModel.onOtpAutoFilled(otp)
+   }
+
+   // 2. Register it with the system (Android 14+ requires export flag)
+   val intentFilter = IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION)
+   registerReceiver(smsBroadcastReceiver, intentFilter, Context.RECEIVER_EXPORTED)
+
+4. HOW TO AUTO FILL FROM SMS
+---------------------------------------------------------
+For the app to automatically read the SMS without user interaction ("Zero Tap"):
+
+   1. The message body MUST start with: <#>
+   2. The message body MUST end with: Your App Hash
+   3. The message length should be < 140 bytes.
+   
+   Example format:
+   <#> Your OTP code is 9948 eLbJtc3XGlL
+
+   *Note*: If the hash does not match exactly, Android will not deliver the SMS to the app.
+
+5. HOW TO AUTO FILL FROM WHATSAPP
+---------------------------------------------------------
+WhatsApp "Zero Tap" functionality uses the same Android SMS Retriever API mechanism.
+
+   1. Go to your BSP (WhatsApp Business Service Provider) Dashboard.
+   2. Create a new "Authentication" template.
+   3. Select the "Zero Tap" (or One Tap/Autofill) option.
+   4. It will ask for your Android Package Name:
+      -> com.example.fazpassotp
+   5. It will ask for your App Signing Hash:
+      -> Paste the 11-character hash from Step 1.
+   
+   When you send this template via WhatsApp API, WhatsApp automatically formats the hidden metadata so that Android recognizes it and passes the code to your app, triggering the auto-fill.
