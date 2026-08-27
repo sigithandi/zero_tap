@@ -14,8 +14,24 @@ Method A: Using Logcat (Easiest for Debugging)
    *IMPORTANT*: This hash is generated from your keystore. If you move to a new computer or build a Release APK (signed with a release key), this hash WILL CHANGE. You must assume the hash you get in Debug mode is different from your Production mode.
 
 Method B: Using Keytool (For Production/Release)
-   To generate the hash without running the app, use this command structure (requires Linux/Mac terminal or Git Bash):
-   keytool -exportcert -alias <your-key-alias> -keystore <path-to-keystore> | xxd -p | tr -d "[:space:]" | echo -n com.example.fazpassotp `cat` | sha256sum | tr -d "[:space:]-" | xxd -r -p | base64 | cut -c1-11
+   To generate the hash without running the app.
+
+   The hash is SHA-256 of the string "<package-name> <certificate-in-lowercase-hex>",
+   truncated to the first 9 bytes and Base64-encoded to 11 characters:
+
+   SIG=$(keytool -exportcert -alias <your-key-alias> -keystore <path-to-keystore> \
+           -storepass <password> | od -An -tx1 | tr -d ' \n')
+   printf "%s %s" "com.example.fazpassotp" "$SIG" \
+     | openssl dgst -sha256 -binary | head -c 9 | openssl base64 | cut -c1-11
+
+   Current values for this project's committed debug key (app/debug.keystore):
+     Package name : com.example.fazpassotp
+     App hash     : 2D+LYGmTWtB
+
+   *IMPORTANT*: The debug keystore is now committed at app/debug.keystore and pinned
+   in app/build.gradle.kts, so every machine produces this same hash. A release build
+   signed with a different key will produce a DIFFERENT hash that must be registered
+   separately on the template.
 
 2. HOW TO USE AppSignatureHelper IN CODE
 ---------------------------------------------------------
@@ -46,17 +62,29 @@ How it works:
    5. Inside `onReceive`, it parses the message (using Regex) to find the 4-digit code.
    6. It invokes a callback function (lambda) to pass this code back to `MainActivity`.
 
-How to use it (in MainActivity):
+*IMPORTANT*: The receiver cannot hold a callback field. For WhatsApp zero-tap the
+receiver is declared in AndroidManifest.xml, which means Android constructs it
+itself via the no-arg constructor - any listener set from MainActivity would exist
+on a different instance. Codes are therefore handed off through OtpBus, a
+process-level SharedFlow that the Activity collects:
 
-   // 1. Define the callback action (what to do with the OTP)
-   val smsBroadcastReceiver = SmsBroadcastReceiver { otp ->
-       // Example: Update ViewModel
-       viewModel.onOtpAutoFilled(otp)
+   // MainActivity
+   lifecycleScope.launch {
+       repeatOnLifecycle(Lifecycle.State.STARTED) {
+           OtpBus.codes.collect { code ->
+               OtpBus.clear()
+               viewModel.onOtpAutoFilled(code)
+           }
+       }
    }
 
-   // 2. Register it with the system (Android 14+ requires export flag)
+The SMS Retriever action is registered at runtime (Android 14+ requires the flag):
+
    val intentFilter = IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION)
    registerReceiver(smsBroadcastReceiver, intentFilter, Context.RECEIVER_EXPORTED)
+
+The WhatsApp action is NOT registered at runtime - the manifest entry covers it,
+and doing both would deliver every code twice.
 
 4. HOW TO AUTO FILL FROM SMS
 ---------------------------------------------------------
@@ -84,3 +112,84 @@ WhatsApp "Zero Tap" functionality uses the same Android SMS Retriever API mechan
       -> Paste the 11-character hash from Step 1.
    
    When you send this template via WhatsApp API, WhatsApp automatically formats the hidden metadata so that Android recognizes it and passes the code to your app, triggering the auto-fill.
+
+   6. HANDSHAKE (required - zero-tap does not work without it)
+      Before each OTP is sent, the app must broadcast com.whatsapp.otp.OTP_REQUESTED
+      to WhatsApp. This is done in MainViewModel.performWhatsAppHandshake() via
+      WhatsAppOtpHandler().sendOtpIntentToWhatsApp(context), which covers both
+      com.whatsapp and com.whatsapp.w4b. Without a fresh handshake WhatsApp falls
+      back to showing a copy-code button and never broadcasts OTP_RETRIEVED.
+
+      SDK 1.0.0 returns the request_id (a UUID) it attached to that handshake.
+      WhatsApp echoes it back with the code, so it is stored via
+      WhatsAppOtp.storeHandshakeId() and checked on the way in. It goes to
+      SharedPreferences, not a field: WhatsApp's broadcast can start the app's
+      process from cold.
+
+   7. WHATSAPP'S ELIGIBILITY CHECKLIST (all must pass, or NO broadcast is sent)
+      From Meta's zero-tap documentation. If any check fails, the WhatsApp client
+      silently downgrades to a one-tap or copy-code button and tells the app
+      nothing at all:
+
+        1. A handshake was sent no more than 10 minutes ago (or no more than
+           code_expiration_minutes, if the template sets it).
+        2. The package name in the message matches the package that created the
+           handshake's PendingIntent.
+        3. The app signing key hash in the message matches the installed app's.
+        4. The app declares a ONE-TAP AUTOFILL ACTIVITY for OTP_RETRIEVED.
+        5. The app declares a ZERO-TAP BROADCAST RECEIVER for OTP_RETRIEVED.
+
+      Check 4 is easy to miss - zero-tap never launches that activity, so it looks
+      unnecessary, but WhatsApp refuses to broadcast without it. Both components
+      are declared in AndroidManifest.xml:
+
+        <activity android:name="com.example.fazpassotp.OtpAutofillActivity"
+                  android:exported="true" android:launchMode="standard">
+            <intent-filter>
+                <action android:name="com.whatsapp.otp.OTP_RETRIEVED" />
+            </intent-filter>
+        </activity>
+
+        <receiver android:name="com.example.fazpassotp.utils.SmsBroadcastReceiver"
+                  android:exported="true">
+            <intent-filter>
+                <action android:name="com.whatsapp.otp.OTP_RETRIEVED" />
+            </intent-filter>
+        </receiver>
+
+   8. TEMPLATE SIDE (BSP / Graph API)
+      The buttons component must look like this, with the hash from step 1:
+
+        {
+          "type": "buttons",
+          "buttons": [{
+            "type": "otp",
+            "otp_type": "zero_tap",
+            "zero_tap_terms_accepted": true,
+            "supported_apps": [{
+              "package_name": "com.example.fazpassotp",
+              "signature_hash": "2D+LYGmTWtB"
+            }]
+          }]
+        }
+
+      signature_hash must be exactly 11 characters. supported_apps holds up to 5
+      apps, so a release build signed with a different key can be added alongside
+      the debug entry instead of replacing it.
+
+6. DEBUGGING ZERO TAP
+---------------------------------------------------------
+When zero-tap silently does nothing, WhatsApp reports the reason through the
+"error" and "error_message" extras on the incoming intent. SmsBroadcastReceiver
+logs these via processOtpDebugSignals. Filter logcat on:
+
+   adb logcat -s SmsBroadcastReceiver:* MainViewModel:* AppSignatureHelper:* OtpBus:*
+
+Checklist when nothing arrives:
+   - "Hash identifying this app" in logcat matches the hash on the template.
+   - Package name on the template is exactly com.example.fazpassotp.
+   - "Sent OTP_REQUESTED handshake to WhatsApp (request_id=...)" appears BEFORE the
+     send request.
+   - OtpAutofillActivity is declared in the manifest (eligibility check 4 above).
+   - The template is an Authentication template with zero-tap enabled and
+     zero_tap_terms_accepted set to true on the BSP side.

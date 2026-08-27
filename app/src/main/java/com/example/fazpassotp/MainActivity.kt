@@ -1,11 +1,10 @@
 package com.example.fazpassotp
 
-import android.app.PendingIntent
-import android.app.PendingIntent.FLAG_IMMUTABLE
-import android.content.Intent
+import android.content.Context
 import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -13,70 +12,29 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.fazpassotp.ui.AppContent
 import com.example.fazpassotp.ui.MainViewModel
+import com.example.fazpassotp.utils.AppSignatureHelper
+import com.example.fazpassotp.utils.OtpBus
 import com.example.fazpassotp.utils.SmsBroadcastReceiver
 import com.google.android.gms.auth.api.phone.SmsRetriever
-
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
-    private lateinit var smsBroadcastReceiver: SmsBroadcastReceiver
+    private val smsBroadcastReceiver = SmsBroadcastReceiver()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        viewModel.setcontext(this)
-        // Log App Hash for SMS Retriever
-        try {
-            val appSignatureHelper = com.example.fazpassotp.utils.AppSignatureHelper(this)
-            for (signature in appSignatureHelper.appSignatures) {
-                android.util.Log.e("AppSignatureHelper", "Hash identifying this app: $signature")
-                viewModel.appHash = signature
-            }
-        } catch (e: Throwable) {
-            android.util.Log.e("AppSignatureHelper", "Failed to generate app hash", e)
-        }
 
-        // Start SMS Retriever
-        try {
-            val client = SmsRetriever.getClient(this)
-            val task = client.startSmsRetriever()
-            task.addOnSuccessListener {
-                android.util.Log.d("SMS_RETRIEVER", "Task Started Successfully")
-            }
-            task.addOnFailureListener {
-                android.util.Log.e("SMS_RETRIEVER", "Task Failed to Start", it)
-            }
-        } catch (e: Throwable) {
-            android.util.Log.e("SMS_RETRIEVER", "Failed to initialize SmsRetriever: ${e.message}", e)
-        }
+        logAppHash()
+        registerSmsRetrieverReceiver()
+        collectOtpCodes()
 
-        // Register Broadcast Receiver for Zero Tap
-        smsBroadcastReceiver = SmsBroadcastReceiver ()
-        smsBroadcastReceiver.setOnOtpReceivedListener{ otp ->
-            viewModel.onOtpAutoFilled(otp)
-        }
-        val intentFilter = IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION)
-        intentFilter.addAction("com.whatsapp.otp.OTP_RETRIEVED")
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(smsBroadcastReceiver, intentFilter, android.content.Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(smsBroadcastReceiver, intentFilter)
-        }
-
-        // --- Start User Consent API (Fallback) ---
-        val consentTask = SmsRetriever.getClient(this).startSmsUserConsent(null)
-        consentTask.addOnSuccessListener {
-            android.util.Log.d("SMS_CONSENT", "Consent Task Started")
-        }
-        consentTask.addOnFailureListener {
-            android.util.Log.e("SMS_CONSENT", "Consent Task Failed", it)
-        }
-        
-        // Register receiver for User Consent
-        val consentIntentFilter = IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION)
-        registerReceiver(smsConsentReceiver, consentIntentFilter, if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) android.content.Context.RECEIVER_EXPORTED else 0)
         setContent {
             MaterialTheme {
                 Surface(
@@ -88,55 +46,57 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-    
-    // User Consent Receiver
-    private val smsConsentReceiver = object : android.content.BroadcastReceiver() {
-        override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
-            if (SmsRetriever.SMS_RETRIEVED_ACTION == intent.action) {
-                val extras = intent.extras
-                val status = extras?.get(SmsRetriever.EXTRA_STATUS) as? com.google.android.gms.common.api.Status
-                
-                when (status?.statusCode) {
-                    com.google.android.gms.common.api.CommonStatusCodes.SUCCESS -> {
-                        // Get consent intent
-                        val consentIntent = extras.getParcelable<android.content.Intent>(SmsRetriever.EXTRA_CONSENT_INTENT)
-                        try {
-                            // Start activity to show consent dialog
-                            consentLauncher.launch(consentIntent)
-                        } catch (e: Exception) {
-                            android.util.Log.e("SMS_CONSENT", "Failed to launch consent intent", e)
-                        }
-                    }
-                    com.google.android.gms.common.api.CommonStatusCodes.TIMEOUT -> {
-                         android.util.Log.d("SMS_CONSENT", "Consent Timeout")
-                    }
+
+    /**
+     * The hash printed here is the one that must be registered on the WhatsApp
+     * zero-tap template. It is derived from the signing key, so it differs
+     * between debug and release builds.
+     */
+    private fun logAppHash() {
+        val signatures = AppSignatureHelper(this).appSignatures
+        if (signatures.isEmpty()) {
+            Log.e(TAG_HASH, "Could not determine the app signing hash")
+            return
+        }
+        signatures.forEach { Log.i(TAG_HASH, "Hash identifying this app: $it") }
+        viewModel.appHash = signatures.first()
+    }
+
+    /**
+     * Only the SMS Retriever action is registered here. WhatsApp's
+     * OTP_RETRIEVED broadcast is handled by the manifest-declared receiver, which
+     * works even when no Activity is alive; registering it here as well would
+     * deliver every code twice.
+     */
+    private fun registerSmsRetrieverReceiver() {
+        val filter = IntentFilter(SmsRetriever.SMS_RETRIEVED_ACTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(smsBroadcastReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(smsBroadcastReceiver, filter)
+        }
+    }
+
+    private fun collectOtpCodes() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                OtpBus.codes.collect { code ->
+                    OtpBus.clear()
+                    viewModel.onOtpAutoFilled(code)
                 }
             }
         }
     }
-    
-    // Handle Result from Consent Dialog
-    private val consentLauncher = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
-            val message = result.data?.getStringExtra(SmsRetriever.EXTRA_SMS_MESSAGE)
-            if (!message.isNullOrBlank()) {
-                 // Extract OTP
-                 val pattern = java.util.regex.Pattern.compile("(\\d{4})")
-                 val matcher = pattern.matcher(message)
-                 if (matcher.find()) {
-                     val otp = matcher.group(1)
-                     if (otp != null) {
-                        viewModel.onOtpAutoFilled(otp)
-                        android.widget.Toast.makeText(this, "OTP User Consent Success", android.widget.Toast.LENGTH_SHORT).show()
-                     }
-                 }
-            }
-        }
-    }
+
     override fun onDestroy() {
         super.onDestroy()
-        if (::smsBroadcastReceiver.isInitialized) {
-            unregisterReceiver(smsBroadcastReceiver)
-        }
+        runCatching { unregisterReceiver(smsBroadcastReceiver) }
+            .onFailure { Log.w(TAG_SMS, "Receiver was not registered", it) }
     }
+
+    private companion object {
+        const val TAG_HASH = "AppSignatureHelper"
+        const val TAG_SMS = "SMS_RETRIEVER"
     }
+}

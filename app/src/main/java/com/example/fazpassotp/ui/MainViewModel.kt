@@ -1,18 +1,18 @@
 package com.example.fazpassotp.ui
 
-import android.app.PendingIntent
-import android.app.PendingIntent.FLAG_IMMUTABLE
-import android.content.Context
-import android.content.Intent
-import android.os.Build
-import android.os.Bundle
+import android.app.Application
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.fazpassotp.data.Repository
+import com.example.fazpassotp.utils.Config
+import com.example.fazpassotp.utils.WhatsAppOtp
+import com.google.android.gms.auth.api.phone.SmsRetriever
 import com.google.gson.Gson
+import com.whatsapp.otp.android.sdk.WhatsAppOtpHandler
 import kotlinx.coroutines.launch
 
 sealed class ScreenState {
@@ -20,28 +20,37 @@ sealed class ScreenState {
     object OtpInput : ScreenState()
 }
 
-class MainViewModel : ViewModel() {
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
     private val repository = Repository()
-    private lateinit var context: Context
+    private val whatsAppOtpHandler = WhatsAppOtpHandler()
 
     // UI State
     var phoneNumber by mutableStateOf("")
-    var otpInput by mutableStateOf("") // User input for verification
-    
+    var otpInput by mutableStateOf("")
+
     var currentScreen by mutableStateOf<ScreenState>(ScreenState.PhoneInput)
     var isLoading by mutableStateOf(false)
-    var statusMessage by mutableStateOf("") // To show JSON response or errors
+    var statusMessage by mutableStateOf("")
     var appHash by mutableStateOf("Calculating...")
-    
+
     // Internal data
-    private var otpId: String? = null // To store the ID from send response
-    
+    private var otpId: String? = null
+
+    /**
+     * An autofilled code can arrive before the send request has returned an
+     * otpId. Hold on to it and submit as soon as verification is possible,
+     * instead of dropping it.
+     */
+    private var pendingOtp: String? = null
+
     fun clear() {
         phoneNumber = ""
         otpInput = ""
         currentScreen = ScreenState.PhoneInput
         statusMessage = ""
         otpId = null
+        pendingOtp = null
         isLoading = false
     }
 
@@ -50,30 +59,43 @@ class MainViewModel : ViewModel() {
             statusMessage = "Please enter a phone number."
             return
         }
-        
+        if (!Config.isConfigured) {
+            statusMessage = "Missing credentials. Set fazpass.bearerToken and " +
+                "fazpass.gatewayKey in local.properties, then rebuild."
+            return
+        }
+
         isLoading = true
+        pendingOtp = null
         statusMessage = "Generating OTP and sending..."
-        
+
         viewModelScope.launch {
             try {
-                sendOtpIntentToWhatsApp()
+                // Both listeners must be armed before the message goes out.
+                performWhatsAppHandshake()
+                startSmsRetriever()
+
                 val randomOtp = repository.generateRandomOtp()
                 val response = repository.sendOtp(phoneNumber, randomOtp)
-                
+
                 val responseBody = response.body()
                 val jsonResponse = Gson().toJson(responseBody ?: response.errorBody()?.string())
-                
                 statusMessage = "Request Response:\n$jsonResponse"
-                
+
                 if (response.isSuccessful && responseBody?.status == true) {
                     otpId = responseBody.data?.id
                     if (otpId != null) {
-                       currentScreen = ScreenState.OtpInput
+                        currentScreen = ScreenState.OtpInput
+                        // Flush a code that arrived while the request was in flight.
+                        pendingOtp?.let { buffered ->
+                            pendingOtp = null
+                            submitOtp(buffered)
+                        }
                     } else {
-                       statusMessage += "\n\nError: OTP ID not found in response."
+                        statusMessage += "\n\nError: OTP ID not found in response."
                     }
                 } else {
-                     statusMessage += "\n\nRequest Failed: ${response.message()}"
+                    statusMessage += "\n\nRequest Failed: ${response.message()}"
                 }
             } catch (e: Exception) {
                 statusMessage = "Error: ${e.localizedMessage}"
@@ -83,28 +105,70 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Tells WhatsApp this app is ready to receive a zero-tap code. Without a
+     * fresh handshake WhatsApp falls back to showing a copy-code button and
+     * never broadcasts OTP_RETRIEVED.
+     */
+    private fun performWhatsAppHandshake() {
+        val context = getApplication<Application>()
+        try {
+            if (!whatsAppOtpHandler.isWhatsAppInstalled(context)) {
+                Log.w(TAG, "WhatsApp is not installed; zero-tap will not fire")
+                statusMessage = "WhatsApp is not installed - zero-tap unavailable."
+                return
+            }
+            if (!whatsAppOtpHandler.isWhatsAppOtpHandshakeSupported(context)) {
+                Log.w(TAG, "Installed WhatsApp version does not support the OTP handshake")
+                statusMessage = "Installed WhatsApp does not support zero-tap."
+                return
+            }
+            // The SDK returns the request_id it put on the handshake. WhatsApp
+            // echoes it back with the code, and it has to outlive this process,
+            // so it is persisted rather than kept in a field here.
+            val handshakeId = whatsAppOtpHandler.sendOtpIntentToWhatsApp(context)
+            WhatsAppOtp.storeHandshakeId(context, handshakeId)
+            Log.d(TAG, "Sent OTP_REQUESTED handshake to WhatsApp (request_id=$handshakeId)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send the WhatsApp handshake", e)
+        }
+    }
+
+    /**
+     * An SMS Retriever session only lasts five minutes, so it is started per
+     * request rather than once at startup - otherwise the fallback path works on
+     * the first attempt and silently stops working on any later one.
+     *
+     * Note: SMS Retriever and the SMS User Consent API are mutually exclusive.
+     * Only Retriever is started, since zero-tap autofill requires no interaction.
+     */
+    private fun startSmsRetriever() {
+        val context = getApplication<Application>()
+        SmsRetriever.getClient(context).startSmsRetriever()
+            .addOnSuccessListener { Log.d(TAG, "SMS Retriever started") }
+            .addOnFailureListener { Log.e(TAG, "SMS Retriever failed to start", it) }
+    }
+
     fun validateOtp() {
-        if (otpId == null) {
+        val id = otpId
+        if (id == null) {
             statusMessage = "Error: No OTP ID to verify against."
             return
         }
-        
         if (otpInput.isBlank()) {
             statusMessage = "Please enter the OTP."
             return
         }
 
         isLoading = true
-        statusMessage = "Verifying..." // Keep previous response visible? No, request says display response.
-        
+        statusMessage = "Verifying..."
+
         viewModelScope.launch {
             try {
-                val response = repository.verifyOtp(otpId!!, otpInput)
+                val response = repository.verifyOtp(id, otpInput)
                 val responseBody = response.body()
-                val jsonResponse = Gson().toJson(responseBody ?: response.errorBody()?.string())
-                
-                statusMessage = "Verify Response:\n$jsonResponse"
-                
+                statusMessage = "Verify Response:\n" +
+                    Gson().toJson(responseBody ?: response.errorBody()?.string())
             } catch (e: Exception) {
                 statusMessage = "Error: ${e.localizedMessage}"
             } finally {
@@ -112,49 +176,24 @@ class MainViewModel : ViewModel() {
             }
         }
     }
+
+    /** Called for codes delivered by WhatsApp zero-tap or the SMS Retriever. */
     fun onOtpAutoFilled(otp: String) {
-        if (currentScreen is ScreenState.OtpInput) {
-            otpInput = otp
-            validateOtp() // Auto-submit for true "Zero Tap" experience
+        if (otpId == null) {
+            Log.d(TAG, "OTP arrived before the send request completed; buffering")
+            pendingOtp = otp
+            return
         }
-    }
-    fun setcontext(context: Context){
-        this.context = context
-
+        submitOtp(otp)
     }
 
-    fun sendOtpIntentToWhatsApp() {
-        // Send OTP_REQUESTED intent to both WA and WA Business App
-        sendOtpIntentToWhatsApp("com.whatsapp")
-        sendOtpIntentToWhatsApp("com.whatsapp.w4b")
-    }
-    private fun sendOtpIntentToWhatsApp(packageName: String?) {
-        /**
-         * Starting with Build.VERSION_CODES.S, it will be required to explicitly
-         * specify the mutability of  PendingIntents on creation with either
-         * (@link #FLAG_IMMUTABLE} or FLAG_MUTABLE
-         */
-
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) FLAG_IMMUTABLE else 0
-        val pi = PendingIntent.getActivity(
-            context,
-            0,
-            Intent(),
-            flags
-        )
-
-        // Send OTP_REQUESTED intent to WhatsApp
-        val intentToWhatsApp = Intent()
-        intentToWhatsApp.setPackage(packageName)
-        intentToWhatsApp.setAction("com.whatsapp.otp.OTP_REQUESTED")
-        // WA will use this to verify the identity of the caller app.
-        var extras = intentToWhatsApp.getExtras()
-        if (extras == null) {
-            extras = Bundle()
-        }
-        extras.putParcelable("_ci_", pi)
-        intentToWhatsApp.putExtras(extras)
-        context.sendBroadcast(intentToWhatsApp)
+    private fun submitOtp(otp: String) {
+        otpInput = otp
+        currentScreen = ScreenState.OtpInput
+        validateOtp()
     }
 
+    private companion object {
+        const val TAG = "MainViewModel"
+    }
 }

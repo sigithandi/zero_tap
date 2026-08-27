@@ -19,6 +19,25 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!--
+            One-tap autofill target. WhatsApp checks that this activity exists
+            before it will start the zero-tap broadcast at all, so it is required
+            even though zero-tap never launches it.
+        -->
+        <activity
+            android:name="com.example.fazpassotp.OtpAutofillActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="standard"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="com.whatsapp.otp.OTP_RETRIEVED" />
+            </intent-filter>
+        </activity>
+
+        <!-- Zero-tap broadcast target. -->
         <receiver
             android:name="com.example.fazpassotp.utils.SmsBroadcastReceiver"
             android:enabled="true"

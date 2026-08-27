@@ -3,6 +3,7 @@ package com.example.fazpassotp.utils
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.os.Build
 import android.util.Base64
 import android.util.Log
@@ -18,6 +19,13 @@ import java.util.Arrays
  */
 class AppSignatureHelper(context: Context) : ContextWrapper(context) {
 
+    /**
+     * Note: for an app distributed through Play App Signing, the hash that
+     * matters in production is derived from Google's signing key, which is only
+     * visible in the Play Console (App integrity > App signing). The value
+     * computed here reflects the key this APK was actually signed with.
+     */
+
     val appSignatures: ArrayList<String>
         get() {
             val appCodes = ArrayList<String>()
@@ -29,11 +37,22 @@ class AppSignatureHelper(context: Context) : ContextWrapper(context) {
                 
                 val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val packageInfo = packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-                    packageInfo.signingInfo.apkContentsSigners
+                    val signingInfo = packageInfo.signingInfo
+                    when {
+                        signingInfo == null -> {
+                            Log.e(TAG, "No signing info available for $packageName")
+                            emptyArray<Signature>()
+                        }
+                        // Under Play App Signing, apkContentsSigners reports the
+                        // upload key, not the key Play re-signs with. The rotation
+                        // history contains every certificate the app has shipped
+                        // with, so hash all of them and register each one.
+                        signingInfo.hasMultipleSigners() -> signingInfo.apkContentsSigners
+                        else -> signingInfo.signingCertificateHistory ?: signingInfo.apkContentsSigners
+                    }
                 } else {
                     @Suppress("DEPRECATION")
-                    val packageInfo = packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
-                    packageInfo.signatures
+                    packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES).signatures
                 }
 
                 // For each signature create a compatible hash
